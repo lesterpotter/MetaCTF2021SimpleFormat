@@ -1,0 +1,185 @@
+fundamentals: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=fac9d3a9b0e15abd6bb17bcd1d3ac6e84d04a5d4, for GNU/Linux 3.2.0, not stripped
+
+[*] '/home/les/Meta/SimpleFormat/fundamentals'
+    Arch:     amd64-64-little
+    RELRO:    Full RELRO
+    Stack:    Canary found
+    NX:       NX enabled
+    PIE:      PIE enabled
+
+Vulnerability:
+   Printf using user supplied format string.
+
+Leaks the stack
+The flag is on the stack.
+Using the %n$ formatting expression, the nth item on the parameter list can
+be accessed.  Using GDB, the offset from the stack pointer to the flag in
+memory (on the stack) is known.  That memory starts at the 8th parameter
+on the stack.  Extracting parameter 8 through 13 as long values and then
+converting to ascii yields...
+
+MetaCTF{L34kIn9_7h3_574CK_I5_oNLY_7H3_839innin9_wh47_3L53_C4n_yOU_do}
+
+This is considered a wrong answer to the problem.
+There is a second flag called flag2.txt in the same location.  The Docker
+file is a hint and confirmation and indicates where the file can be found.
+
+A Printf Format exploit can do more than just leak the stack.  With it,
+memory locations on the stack can be written to.
+
+However, there is no memory leak to leverage prior to the FMT string exploit.
+The exploit can leak memory, but the program exits without being able to use
+the information.  Without a known address to the RIP, or to a known GOT/PLT entry,
+there is no target address to include in the FMT exploit.
+
+BUT... in this case, there is garbage left in the format string buffer from prior
+subroutine calls.  Some of that garbage is memory address to areas in the stack
+that are close to a stored RIP address.  Using the FMT exploit, repeatedly with
+different offsets, the unused portion of the format string buffer can be examined.
+It turns out that though the addresses do not repeat, the locations in the buffer
+remain consistent.  Using GDB, the different slots are characterized as Stack
+address, program address, libc address, or unhelpful.
+
+By setting a breakpoint at *main+181, the program is stopped just prior to the read that
+fills the Format String buffer.  It turns out there are two stack addresses in the
+immediate vicinity of the format string buffer. The first one, 24 bytes into the buffer
+has an address close enough that only one byte change would need to be adjusted
+to make it match the stack address of the RIP.
+
+Note: even close values can have different higher order bytes depending on how close
+they are to the addition carry.  The further apart the addresses are, the more likely
+that no single byte change could make the two the same.  Making a two byte change
+would require an average of 2048 attempts to find the write value.
+
+When examining the test program's stack, parameter 25 stands out as the nearest
+stack pointer to the RIP stack pointer address.  So, by writing a format string that
+reaches parameter 25 (24 bytes into the format string buffer) and then overwrites
+the first byte of the address, the RIP can become the target of a FMT exploit that
+writes to the address where the RIP address is stored, thus taking control of the
+RIP.  The stack appears to consistently point at 0x8 + a multiple of 0x10.
+
+Repeatedly running the program and overwriting the first byte of the address with
+0xC8, it is expected to take an average of 16 attempts before the RIP address is
+hit.  The next thing is to find a ROPgadget of value.
+
+By reviewing the vmmap and memory following the Format Buffer pointer, there is
+found an address to 'main' lurking just 4 longlong integers beyond our RIP.  When
+a 'RET' is made and the RIP is loaded, the stack will be popped, and there will
+only be 3.  There happens to be a ROPgadget within a short distance of the RIP
+value that does a "  add RAX, [RSP + 0x18]; ret  ".  This is perfect for pointing
+the RIP to the start of 'main' where the program will re-run and all the leaks
+can be used to build a final exploit with known addresses.
+
+To find the ROP gadget, the libc-2.28.so file was extracted from the Docker container.
+Then ROPgadget was run on the file.  Also, "objdump -T" was run to get the symbol
+offsets.  The RET originally was returning to an address with the 5 low significant
+address hexits being 0x140b9.  Subtracting the libc base address yielded and offset
+of 0x240b9.  The ROP of choice would need to have an offset of between 0x24000
+and 0x240FF in order to be a one byte change.  A two byte change could work
+if nothing could be found.  But by sorting the ROPs by offset, and looking in this
+range, the RSP+0x18 stood out quickly.
+
+The application of this approach to this point worked perfectly against the local
+Docker container, but it failed against the remote system.
+
+Using the leaks, and examining the format string buffer of the remote system, there
+was found another address in the buffer that was close to param 25 in value.  I
+cannot explain why the programs run differently and the remote buffer contains 3
+addresses while the Docker base one contains only two.  But modifying the exploit
+to work with parameter 26, allowed the exploit to repeatedly call 'main' on the
+remote.  This was a relief, because I was beginning to wonder if the Libc file I
+had was different from the remote.  Now, with a working partial exploit, I had 
+additional confirmation that the Libc file was the same (or very close to it).
+
+Now the exploit to get the second flag could be developed.
+
+
+
+APPENICES
+
+Analysis:
+It doesn't help to target a memory location that is not writeable.  The goal is to
+either change RIP or change a GOT/PLT pointer (for a function that will get called)
+to something that helps the exploit
+
+Here is the memory currently in the buffer or following it...
+The elements that don't help have been removed
+0x7ffd9e514380: Start of Format String Buffer
+0x7ffd9e514398: 0x00007ffd9e5143c6 rw Can be changed by FMT
+0x7ffd9e5143a8: 0x00007f607ab2daf5 RO Target Libc
+0x7ffd9e5143b8: 0x000055b7223dc335 RO Target PROGRAM
+0x7ffd9e5143c0: 0x00007f607ac61530 RO Tartet Ld
+0x7ffd9e5143d0: 0x000055b7223dc2f0 RO Target PROGRAM
+0x7ffd9e5143d8: 0x000055b7223dc0c0 RO Target PROGRAM
+0x7ffd9e5143e0: 0x00007ffd9e5144d0 rw Can be changed by FMT
+0x7ffd9e5143e8: 0x265a5bea63694400 CANARY (cant use as an address)
+0x7ffd9e5143f0: 0x000055b7223dc2f0 RIP
+0x7ffd9e5143f8: 0x00007f607aaaf09b RO Target Libc
+0x7ffd9e514408: 0x00007ffd9e5144d8 rw Can be changed by FMT
+0x7ffd9e514418: 0x000055b7223dc1a5 RO Target PROGRAM (MAIN)
+0x7ffd9e514430: 0x000055b7223dc0c0 RO Target PROGRAM
+0x7ffd9e514438: 0x00007ffd9e5144d0 rw Can be changed by FMT
+0x7ffd9e514478: 0x00007ffd9e5144e8 rw Can be changed by FMT
+0x7ffd9e514488: 0x00007f607ac61476 RO Target Ld
+0x7ffd9e5144a0: 0x000055b7223dc0c0 RO Target PROGRAM
+0x7ffd9e5144a8: 0x00007ffd9e5144d0 rw Can be changed by FMT
+0x7ffd9e5144b8: 0x000055b7223dc0ea RO Target PROGRAM
+0x7ffd9e5144c0: 0x00007ffd9e5144c8 rw Can be changed by FMT
+0x7ffd9e5144d8: 0x00007ffd9e515e96 rw Can be changed by FMT
+0x7ffd9e5144e8: 0x00007ffd9e515ea5 rw Can be changed by FMT
+0x7ffd9e5144f0: 0x00007ffd9e515ebc rw Can be changed by FMT
+0x7ffd9e5144f8: 0x00007ffd9e515ec6 rw Can be changed by FMT
+
+And here are the writeable areas from the vmmap
+gef➤  vmmap
+[ Legend:  Code | Heap | Stack ]
+Start              End                Offset             Perm Path
+0x000055b7223df000 0x000055b7223e0000 0x0000000000003000 rw- /fundamentals/fundamentals
+0x00007f607ac46000 0x00007f607ac48000 0x00000000001ba000 rw- /lib/x86_64-linux-gnu/libc-2.28.so
+0x00007f607ac48000 0x00007f607ac4e000 0x0000000000000000 rw- 
+0x00007f607ac7a000 0x00007f607ac7b000 0x0000000000027000 rw- /lib/x86_64-linux-gnu/ld-2.28.so
+0x00007f607ac7b000 0x00007f607ac7c000 0x0000000000000000 rw- 
+0x00007ffd9e4f5000 0x00007ffd9e516000 0x0000000000000000 rw- [stack]
+gef➤  
+
+ROP gadgets in the 24000 range
+0x000000000002401f : and al, 8 ; mov edi, dword ptr [rsp + 0x14] ; mov rdx, qword ptr [rax] ; call rbp
+0x0000000000024020 : or byte ptr [rbx + 0x4814247c], cl ; mov edx, dword ptr [rax] ; call rbp
+0x0000000000024021 : mov edi, dword ptr [rsp + 0x14] ; mov rdx, qword ptr [rax] ; call rbp
+0x0000000000024022 : jl 0x24048 ; adc al, 0x48 ; mov edx, dword ptr [rax] ; call rbp
+0x0000000000024023 : and al, 0x14 ; mov rdx, qword ptr [rax] ; call rbp
+0x0000000000024024 : adc al, 0x48 ; mov edx, dword ptr [rax] ; call rbp
+0x0000000000024025 : mov rdx, qword ptr [rax] ; call rbp
+0x0000000000024026 : mov edx, dword ptr [rax] ; call rbp
+0x0000000000024028 : call rbp
+0x0000000000024035 : add dword ptr [rax], eax ; add byte ptr [rbp - 0x7b], al ; test byte ptr [rdi], 0x85 ; retf
+0x0000000000024037 : add byte ptr [rbp - 0x7b], al ; test byte ptr [rdi], 0x85 ; retf
+0x000000000002403a : test byte ptr [rdi], 0x85 ; retf
+0x0000000000024090 : adc al, 0x48 ; mov edx, dword ptr [rax] ; mov rax, qword ptr [rsp + 0x18] ; call rax
+0x0000000000024091 : mov rdx, qword ptr [rax] ; mov rax, qword ptr [rsp + 0x18] ; call rax
+0x0000000000024092 : mov edx, dword ptr [rax] ; mov rax, qword ptr [rsp + 0x18] ; call rax
+0x0000000000024093 : adc byte ptr [rax - 0x75], cl ; and al, 0x18 ; call rax
+0x0000000000024094 : mov rax, qword ptr [rsp + 0x18] ; call rax
+0x0000000000024095 : mov eax, dword ptr [rsp + 0x18] ; call rax
+0x0000000000024097 : and al, 0x18 ; call rax
+0x0000000000024099 : call rax
+0x00000000000240aa : xchg ebp, ecx ; adc eax, 0x308b4800 ; xor eax, eax ; call qword ptr [rdx + 0x168]
+0x00000000000240ac : adc eax, 0x308b4800 ; xor eax, eax ; call qword ptr [rdx + 0x168]
+0x00000000000240ae : mov rsi, qword ptr [rax] ; xor eax, eax ; call qword ptr [rdx + 0x168]
+0x00000000000240af : mov esi, dword ptr [rax] ; xor eax, eax ; call qword ptr [rdx + 0x168]
+0x00000000000240b1 : xor eax, eax ; call qword ptr [rdx + 0x168]
+0x00000000000240b3 : call qword ptr [rdx + 0x168]
+0x00000000000240b7 : add byte ptr [rax], al ; jmp 0x24010
+0x00000000000240b9 : jmp 0x24010
+0x00000000000240c9 : xor rax, qword ptr fs:[0x30] ; call rax
+0x00000000000240ca : xor rax, qword ptr [0x30] ; call rax
+0x00000000000240cb : xor eax, dword ptr [0x30] ; call rax
+0x00000000000240cc : add al, 0x25 ; xor byte ptr [rax], al ; add byte ptr [rax], al ; call rax
+0x00000000000240cd : and eax, 0x30 ; call rax
+0x00000000000240ce : xor byte ptr [rax], al ; add byte ptr [rax], al ; call rax
+0x00000000000240d0 : add byte ptr [rax], al ; call rax
+0x00000000000240ea : or byte ptr [rdi], cl ; xchg eax, esp ; ret 0xd284
+0x00000000000240ec : xchg eax, esp ; ret 0xd284
+0x00000000000240ed : ret 0xd284
+0x00000000000240fc : add byte ptr [rax], al ; add byte ptr [rax], al ; xor edi, edi ; mov eax, edx ; syscall
+0x00000000000240fe : add byte ptr [rax], al ; xor edi, edi ; mov eax, edx ; syscall

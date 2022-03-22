@@ -1,0 +1,1 @@
+MyCTF{fake_flag_number_2}
